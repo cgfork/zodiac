@@ -1,3 +1,5 @@
+use std::{convert::Infallible, io};
+
 use bytes::{BufMut, BytesMut};
 use tokio_util::codec;
 
@@ -38,14 +40,6 @@ pub const AUTH_VERSION: u8 = 0x01;
 
 // Auth Status
 pub const AUTH_SUCCEED: u8 = 0x00;
-
-///  The destination address.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DstAddr {
-    IPv4([u8; 4]),
-    IPv6([u8; 16]),
-    Domain(String),
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
@@ -132,7 +126,7 @@ pub enum Item {
     ///    o  IP V6 address: X04
     /// o  DST.ADDR desired destination address
     /// o  DST.PORT desired destination port in network octet order
-    Command(u8, DstAddr, u16),
+    Command(u8, u8, Vec<u8>, u16),
 
     /// The SOCKS request information is sent by the client as soon as it has
     /// established a connection to the SOCKS server, and completed the
@@ -167,10 +161,11 @@ pub enum Item {
     /// o  BND.PORT       server bound port in network octet order
     ///
     /// Fields marked RESERVED (RSV) must be set to X00.
-    Reply(u8, DstAddr, u16),
+    Reply(u8, u8, Vec<u8>, u16),
 }
 
-enum CodecState {
+#[derive(Debug)]
+pub(crate) enum DecoderState {
     Methods,
     Selection,
     UserAndPass,
@@ -179,34 +174,36 @@ enum CodecState {
     Reply,
 }
 
-pub struct Codec {
-    state: CodecState,
+pub struct Decoder {
+    state: DecoderState,
 }
 
-impl Codec {
-    pub(crate) fn set_next_state(&mut self, state: CodecState) {
+impl Decoder {
+    pub(crate) fn set_next_state(&mut self, state: DecoderState) {
         self.state = state;
     }
 }
 
-impl codec::Decoder for Codec {
+impl codec::Decoder for Decoder {
     type Item = Item;
 
     type Error = crate::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         match self.state {
-            CodecState::Methods => todo!(),
-            CodecState::Selection => todo!(),
-            CodecState::UserAndPass => todo!(),
-            CodecState::Status => todo!(),
-            CodecState::Command => todo!(),
-            CodecState::Reply => todo!(),
+            DecoderState::Methods => todo!(),
+            DecoderState::Selection => todo!(),
+            DecoderState::UserAndPass => todo!(),
+            DecoderState::Status => todo!(),
+            DecoderState::Command => todo!(),
+            DecoderState::Reply => todo!(),
         }
     }
 }
 
-impl codec::Encoder<Item> for Codec {
+pub struct Encoder;
+
+impl codec::Encoder<Item> for Encoder {
     type Error = crate::Error;
 
     fn encode(&mut self, item: Item, dst: &mut BytesMut) -> Result<(), Self::Error> {
@@ -227,9 +224,59 @@ impl codec::Encoder<Item> for Codec {
                 dst.put_u8(p.len() as u8);
                 dst.put_slice(p.as_bytes());
             }
-            Item::Status(_) => todo!(),
-            Item::Command(_, _, _) => todo!(),
-            Item::Reply(_, _, _) => todo!(),
+            Item::Status(status) => {
+                dst.put_u8(AUTH_VERSION);
+                dst.put_u8(status);
+            }
+            Item::Command(cmd, atyp, addr, port) => {
+                dst.put_u8(SOCKS_VERSION);
+                dst.put_u8(cmd);
+                dst.put_u8(0x00);
+                dst.put_u8(atyp);
+                match atyp {
+                    DST_IPV4 => {
+                        debug_assert!(addr.len() == 4);
+                        dst.put_slice(&addr);
+                        dst.put_u16(port);
+                    }
+                    DST_IPV6 => {
+                        debug_assert!(addr.len() == 16);
+                        dst.put_slice(&addr);
+                        dst.put_u16(port);
+                    }
+                    DST_DOMAIN => {
+                        dst.put_u8(addr.len() as u8);
+                        dst.put_slice(&addr);
+                        dst.put_u16(port);
+                    }
+                    _ => return Err(crate::Error::AddressTypeNotSupported),
+                }
+            }
+            Item::Reply(rep, atyp, addr, port) => {
+                dst.put_u8(SOCKS_VERSION);
+                dst.put_u8(rep);
+                dst.put_u8(0x00);
+                dst.put_u8(atyp);
+
+                match atyp {
+                    DST_IPV4 => {
+                        debug_assert!(addr.len() == 4);
+                        dst.put_slice(&addr);
+                        dst.put_u16(port);
+                    }
+                    DST_IPV6 => {
+                        debug_assert!(addr.len() == 16);
+                        dst.put_slice(&addr);
+                        dst.put_u16(port);
+                    }
+                    DST_DOMAIN => {
+                        dst.put_u8(addr.len() as u8);
+                        dst.put_slice(&addr);
+                        dst.put_u16(port);
+                    }
+                    _ => return Err(crate::Error::AddressTypeNotSupported),
+                }
+            }
         };
         Ok(())
     }
