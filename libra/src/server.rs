@@ -1,4 +1,6 @@
-use futures_util::SinkExt;
+use std::{io, net::SocketAddr};
+
+use futures_util::{Future, SinkExt};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
@@ -15,13 +17,50 @@ use crate::{
     errors, Destination,
 };
 
-#[derive(Debug, Clone, Default)]
-pub struct Builder {
-    authorization: Option<(String, String)>,
+pub trait Connect {
+    type Err;
+    type Output;
+    type Future<'a>: Future<Output = Result<Self::Output, Self::Err>> + Unpin
+    where
+        Self: 'a;
+
+    fn connect(&self, destination: Destination) -> Self::Future<'_>;
 }
 
-impl Builder {
-    pub async fn handshake<T>(&self, io: T) -> Result<(TcpStream, T), errors::Error>
+pub struct TokioStream;
+
+impl Connect for TokioStream {
+    type Err = io::Error;
+
+    type Output = (TcpStream, SocketAddr);
+
+    type Future<'a> = impl Future<Output = Result<Self::Output, Self::Err>> + Unpin + 'a
+    where
+        Self: 'a;
+
+    fn connect(&self, destination: Destination) -> Self::Future<'_> {
+        Box::pin(async move {
+            let stream = TcpStream::connect(destination.to_string()).await?;
+            let remote_addr = stream.peer_addr()?;
+            Ok((stream, remote_addr))
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Builder<C> {
+    authorization: Option<(String, String)>,
+    connect: C,
+}
+
+impl<C, O, D, E> Builder<C>
+where
+    C: Connect<Output = (O, D), Err = E>,
+    O: AsyncRead + AsyncWrite + Unpin,
+    D: Into<Destination>,
+    E: Into<errors::Error>,
+{
+    pub async fn handshake<T>(&self, io: T) -> Result<(O, T), errors::Error>
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
@@ -89,8 +128,8 @@ impl Builder {
             }
         }
         match self.connect(destination.unwrap()).await {
-            Ok(stream) => {
-                let remote_addr: Destination = stream.peer_addr()?.into();
+            Ok((stream, dst)) => {
+                let remote_addr: Destination = dst.into();
                 let (atyp, addr, port) = remote_addr.into_tuple();
                 frame.send(Item::Reply(SUCCEEDED, atyp, addr, port)).await?;
                 Ok((stream, frame.into_inner()))
@@ -104,8 +143,18 @@ impl Builder {
         }
     }
 
-    async fn connect(&self, destination: Destination) -> Result<TcpStream, errors::Error> {
-        // TODO: DNS
-        Ok(TcpStream::connect(destination.to_string()).await?)
+    async fn connect(&self, destination: Destination) -> Result<(O, D), errors::Error> {
+        Ok(self
+            .connect
+            .connect(destination)
+            .await
+            .map_err(|e| e.into())?)
+    }
+
+    pub fn new(connect: C) -> Self {
+        Self {
+            authorization: None,
+            connect,
+        }
     }
 }

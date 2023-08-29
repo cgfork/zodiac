@@ -1,4 +1,6 @@
 #![feature(slice_as_chunks)]
+#![feature(impl_trait_in_assoc_type)]
+#![allow(dead_code)]
 pub mod client;
 
 mod codec;

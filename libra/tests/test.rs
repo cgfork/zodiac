@@ -1,4 +1,7 @@
-use libra::{client, server};
+use libra::{
+    client,
+    server::{self, TokioStream},
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
@@ -19,7 +22,10 @@ async fn echo() {
     tokio::spawn(async move {
         loop {
             let (stream, _) = listen.accept().await.unwrap();
-            let (mut dst, mut src) = server::Builder::default().handshake(stream).await.unwrap();
+            let (mut dst, mut src) = server::Builder::new(TokioStream)
+                .handshake(stream)
+                .await
+                .unwrap();
             tokio::io::copy_bidirectional(&mut dst, &mut src)
                 .await
                 .unwrap();
