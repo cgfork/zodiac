@@ -1,7 +1,11 @@
-use std::{convert::Infallible, io};
+use std::io;
 
-use bytes::{BufMut, BytesMut};
-use tokio_util::codec;
+use bytes::{Buf, BufMut, BytesMut};
+use futures_util::{SinkExt, StreamExt};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::codec::{self, Framed};
+
+use crate::errors;
 
 // Socks Allowable Methods
 pub const NO_AUTHENTICATION_REQUIRED: u8 = 0x00;
@@ -40,6 +44,22 @@ pub const AUTH_VERSION: u8 = 0x01;
 
 // Auth Status
 pub const AUTH_SUCCEED: u8 = 0x00;
+pub const AUTH_FAILED: u8 = 0x01;
+
+pub(crate) fn rep_str(rep: u8) -> &'static str {
+    match rep {
+        SUCCEEDED => "succeeded",
+        GENERAL_SOCKS_SERVER_FAILURE => "general socks server failure",
+        CONNNECTION_NOT_ALLOWED_BY_RULESET => "connection not allowed by ruleset",
+        NETWORK_UNREACHABLE => "network unreachable",
+        HOST_UNREACHABLE => "host unreachable",
+        CONNECTION_REFUSED => "connection refused",
+        TTL_EXPIRED => "ttl expired",
+        COMMAND_NOT_SUPPORTED => "command not supported",
+        ADDRESS_TYPE_NOT_SUPPORTED => "address type not supported",
+        _ => "unknown",
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
@@ -90,7 +110,7 @@ pub enum Item {
     /// The VER field is set to X01 for this version of the AUTHENTICATION.
     /// USERNAME or PASSWORD is a fixed string. The first octet of the field
     /// contains the number of octects of string that follow.
-    UserAndPass(String, String),
+    UsernamePassword(String, String),
 
     /// The server authenticates the USERNAME and PASSWORD, and sends a
     /// status message:
@@ -164,51 +184,185 @@ pub enum Item {
     Reply(u8, u8, Vec<u8>, u16),
 }
 
-#[derive(Debug)]
-pub(crate) enum DecoderState {
+#[derive(Debug, Clone, Copy)]
+pub enum DecoderState {
     Methods,
     Selection,
-    UserAndPass,
+    UsernamePassword,
     Status,
     Command,
     Reply,
 }
 
-pub struct Decoder {
+pub struct Codec {
     state: DecoderState,
 }
 
-impl Decoder {
+impl Codec {
+    pub fn new(init: DecoderState) -> Self {
+        Self { state: init }
+    }
+
     pub(crate) fn set_next_state(&mut self, state: DecoderState) {
         self.state = state;
     }
 }
 
-impl codec::Decoder for Decoder {
+impl codec::Decoder for Codec {
     type Item = Item;
 
     type Error = crate::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         match self.state {
-            DecoderState::Methods => todo!(),
-            DecoderState::Selection => todo!(),
-            DecoderState::UserAndPass => todo!(),
-            DecoderState::Status => todo!(),
-            DecoderState::Command => todo!(),
-            DecoderState::Reply => todo!(),
+            DecoderState::Methods => {
+                if src.len() < 2 || src[1] as usize > src.len() - 2 {
+                    Ok(None)
+                } else {
+                    assert!(src.get_u8() == SOCKS_VERSION, "Invalid SOCKS version");
+                    let len = src.get_u8() as usize;
+                    let methods = src.split_to(len).to_vec();
+                    Ok(Some(Item::Methods(methods)))
+                }
+            }
+            DecoderState::Selection => {
+                if src.len() < 2 {
+                    Ok(None)
+                } else {
+                    assert!(src.get_u8() == SOCKS_VERSION, "Invalid SOCKS version");
+                    Ok(Some(Item::Selection(src.get_u8())))
+                }
+            }
+            DecoderState::UsernamePassword => {
+                if src.len() < 2 || src[1] as usize > src.len() - 2 {
+                    Ok(None)
+                } else {
+                    if src[2 + src[1] as usize] as usize + src[1] as usize + 2 > src.len() {
+                        return Ok(None);
+                    }
+
+                    assert!(src.get_u8() == AUTH_VERSION, "Invalid AUTH version");
+                    let len = src.get_u8() as usize;
+                    let username = src.split_to(len).to_vec();
+                    let len = src.get_u8() as usize;
+                    let password = src.split_to(len).to_vec();
+                    Ok(Some(Item::UsernamePassword(
+                        String::from_utf8(username).expect("Invalid UTF-8"),
+                        String::from_utf8(password).expect("Invalid UTF-8"),
+                    )))
+                }
+            }
+            DecoderState::Status => {
+                if src.len() < 2 {
+                    Ok(None)
+                } else {
+                    assert!(src.get_u8() == AUTH_VERSION, "Invalid AUTH version");
+                    Ok(Some(Item::Status(src.get_u8())))
+                }
+            }
+            DecoderState::Command => {
+                if src.len() < 4 {
+                    Ok(None)
+                } else {
+                    match src[3] {
+                        DST_IPV4 => {
+                            if src.len() < 10 {
+                                Ok(None)
+                            } else {
+                                assert!(src.get_u8() == SOCKS_VERSION, "Invalid SOCKS version");
+                                let cmd = src.get_u8();
+                                src.advance(2);
+                                let dst_addr = src.split_to(4).to_vec();
+                                let dst_port = src.get_u16();
+                                Ok(Some(Item::Command(cmd, DST_IPV4, dst_addr, dst_port)))
+                            }
+                        }
+                        DST_IPV6 => {
+                            if src.len() < 22 {
+                                Ok(None)
+                            } else {
+                                assert!(src.get_u8() == SOCKS_VERSION, "Invalid SOCKS version");
+                                let cmd = src.get_u8();
+                                src.advance(2);
+                                let dst_addr = src.split_to(16).to_vec();
+                                let dst_port = src.get_u16();
+                                Ok(Some(Item::Command(cmd, DST_IPV6, dst_addr, dst_port)))
+                            }
+                        }
+                        DST_DOMAIN => {
+                            if src.len() < 7 || src[5] as usize > src.len() - 7 {
+                                Ok(None)
+                            } else {
+                                assert!(src.get_u8() == SOCKS_VERSION, "Invalid SOCKS version");
+                                let cmd = src.get_u8();
+                                src.advance(2);
+                                let len = src.get_u8() as usize;
+                                let dst_addr = src.split_to(len).to_vec();
+                                let dst_port = src.get_u16();
+                                Ok(Some(Item::Command(cmd, DST_DOMAIN, dst_addr, dst_port)))
+                            }
+                        }
+                        _ => Err(crate::Error::AddressTypeNotSupported),
+                    }
+                }
+            }
+            DecoderState::Reply => {
+                if src.len() < 4 {
+                    Ok(None)
+                } else {
+                    match src[3] {
+                        DST_IPV4 => {
+                            if src.len() < 10 {
+                                Ok(None)
+                            } else {
+                                assert!(src.get_u8() == SOCKS_VERSION, "Invalid SOCKS version");
+                                let rep = src.get_u8();
+                                src.advance(2);
+                                let dst_addr = src.split_to(4).to_vec();
+                                let dst_port = src.get_u16();
+                                Ok(Some(Item::Reply(rep, DST_IPV4, dst_addr, dst_port)))
+                            }
+                        }
+                        DST_IPV6 => {
+                            if src.len() < 22 {
+                                Ok(None)
+                            } else {
+                                assert!(src.get_u8() == SOCKS_VERSION, "Invalid SOCKS version");
+                                let rep = src.get_u8();
+                                src.advance(2);
+                                let dst_addr = src.split_to(16).to_vec();
+                                let dst_port = src.get_u16();
+                                Ok(Some(Item::Reply(rep, DST_IPV6, dst_addr, dst_port)))
+                            }
+                        }
+                        DST_DOMAIN => {
+                            if src.len() < 7 || src[5] as usize > src.len() - 7 {
+                                Ok(None)
+                            } else {
+                                assert!(src.get_u8() == SOCKS_VERSION, "Invalid SOCKS version");
+                                let rep = src.get_u8();
+                                src.advance(2);
+                                let len = src.get_u8() as usize;
+                                let dst_addr = src.split_to(len).to_vec();
+                                let dst_port = src.get_u16();
+                                Ok(Some(Item::Reply(rep, DST_DOMAIN, dst_addr, dst_port)))
+                            }
+                        }
+                        _ => Err(crate::Error::AddressTypeNotSupported),
+                    }
+                }
+            }
         }
     }
 }
 
-pub struct Encoder;
-
-impl codec::Encoder<Item> for Encoder {
+impl codec::Encoder<Item> for Codec {
     type Error = crate::Error;
 
     fn encode(&mut self, item: Item, dst: &mut BytesMut) -> Result<(), Self::Error> {
         match item {
             Item::Methods(ms) => {
+                dst.reserve(ms.len() + 2);
                 dst.put_u8(SOCKS_VERSION);
                 dst.put_u8(ms.len() as u8);
                 dst.put_slice(&ms);
@@ -217,7 +371,8 @@ impl codec::Encoder<Item> for Encoder {
                 dst.put_u8(SOCKS_VERSION);
                 dst.put_u8(m);
             }
-            Item::UserAndPass(u, p) => {
+            Item::UsernamePassword(u, p) => {
+                dst.reserve(3 + u.len() + p.len());
                 dst.put_u8(AUTH_VERSION);
                 dst.put_u8(u.len() as u8);
                 dst.put_slice(u.as_bytes());
@@ -225,10 +380,12 @@ impl codec::Encoder<Item> for Encoder {
                 dst.put_slice(p.as_bytes());
             }
             Item::Status(status) => {
+                dst.reserve(2);
                 dst.put_u8(AUTH_VERSION);
                 dst.put_u8(status);
             }
             Item::Command(cmd, atyp, addr, port) => {
+                dst.reserve(4);
                 dst.put_u8(SOCKS_VERSION);
                 dst.put_u8(cmd);
                 dst.put_u8(0x00);
@@ -236,15 +393,18 @@ impl codec::Encoder<Item> for Encoder {
                 match atyp {
                     DST_IPV4 => {
                         debug_assert!(addr.len() == 4);
+                        dst.reserve(6);
                         dst.put_slice(&addr);
                         dst.put_u16(port);
                     }
                     DST_IPV6 => {
                         debug_assert!(addr.len() == 16);
+                        dst.reserve(18);
                         dst.put_slice(&addr);
                         dst.put_u16(port);
                     }
                     DST_DOMAIN => {
+                        dst.reserve(3 + addr.len());
                         dst.put_u8(addr.len() as u8);
                         dst.put_slice(&addr);
                         dst.put_u16(port);
@@ -253,23 +413,26 @@ impl codec::Encoder<Item> for Encoder {
                 }
             }
             Item::Reply(rep, atyp, addr, port) => {
+                dst.reserve(4);
                 dst.put_u8(SOCKS_VERSION);
                 dst.put_u8(rep);
                 dst.put_u8(0x00);
                 dst.put_u8(atyp);
-
                 match atyp {
                     DST_IPV4 => {
                         debug_assert!(addr.len() == 4);
+                        dst.reserve(6);
                         dst.put_slice(&addr);
                         dst.put_u16(port);
                     }
                     DST_IPV6 => {
                         debug_assert!(addr.len() == 16);
+                        dst.reserve(18);
                         dst.put_slice(&addr);
                         dst.put_u16(port);
                     }
                     DST_DOMAIN => {
+                        dst.reserve(3 + addr.len());
                         dst.put_u8(addr.len() as u8);
                         dst.put_slice(&addr);
                         dst.put_u16(port);
@@ -279,5 +442,75 @@ impl codec::Encoder<Item> for Encoder {
             }
         };
         Ok(())
+    }
+}
+
+pub(crate) async fn send_wait<T>(
+    frame: &mut Framed<T, Codec>,
+    item: Item,
+    state: DecoderState,
+) -> Result<Item, crate::Error>
+where
+    T: AsyncWrite + AsyncRead + Unpin,
+{
+    frame.codec_mut().set_next_state(state);
+    frame.send(item).await?;
+    if let Some(r) = frame.next().await {
+        let r = r?;
+        if !matches(state, &r) {
+            panic!("unexpected item: {:?}", r);
+        }
+        Ok(r)
+    } else {
+        Err(errors::Error::Io(io::ErrorKind::UnexpectedEof.into()))
+    }
+}
+
+pub(crate) async fn recv<T>(
+    frame: &mut Framed<T, Codec>,
+    state: DecoderState,
+) -> Result<Item, crate::Error>
+where
+    T: AsyncRead + Unpin,
+{
+    frame.codec_mut().set_next_state(state);
+    if let Some(r) = frame.next().await {
+        let r = r?;
+        if !matches(state, &r) {
+            panic!("unexpected item: {:?}", r);
+        }
+        Ok(r)
+    } else {
+        Err(errors::Error::Io(io::ErrorKind::UnexpectedEof.into()))
+    }
+}
+
+fn matches(state: DecoderState, item: &Item) -> bool {
+    matches!(
+        (state, item),
+        (DecoderState::Methods, Item::Methods(_))
+            | (DecoderState::Selection, Item::Selection(_))
+            | (DecoderState::UsernamePassword, Item::UsernamePassword(_, _))
+            | (DecoderState::Status, Item::Status(_))
+            | (DecoderState::Command, Item::Command(_, _, _, _))
+            | (DecoderState::Reply, Item::Reply(_, _, _, _))
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::BytesMut;
+    use tokio_util::codec::{Decoder, Encoder};
+
+    use super::{Codec, DecoderState, Item};
+
+    #[test]
+    fn test_codec() {
+        let item = Item::Methods(vec![1, 2, 3]);
+        let mut buf = BytesMut::new();
+        let mut codec = Codec::new(DecoderState::Methods);
+        codec.encode(item.clone(), &mut buf).unwrap();
+        let item1 = codec.decode(&mut buf).unwrap();
+        assert_eq!(Some(item), item1);
     }
 }

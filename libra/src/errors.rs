@@ -9,20 +9,11 @@ pub enum Error {
     #[error("no acceptable methods")]
     NoAcceptableMethods,
 
-    #[error("general socks server failure")]
-    GeneralSocksServerFailure,
-
-    #[error("connection not allowed by ruleset")]
-    ConnectionNotAllowedByRuleset,
-
-    #[error("ttl expired")]
-    TtlExpired,
-
-    #[error("command not supported")]
-    CommandNotSupported,
-
     #[error("address type not supported")]
     AddressTypeNotSupported,
+
+    #[error("{1}({0})")]
+    Rep(u8, &'static str),
 
     #[error("unknown error")]
     UnknownRep,
@@ -32,4 +23,7 @@ pub enum Error {
 
     #[error("io error:{0}")]
     Io(#[from] std::io::Error),
+
+    #[error("unknown")]
+    Unknown,
 }
