@@ -60,7 +60,7 @@ where
     D: Into<Destination>,
     E: Into<errors::Error>,
 {
-    pub async fn handshake<T>(&self, io: T) -> Result<(O, T), errors::Error>
+    pub async fn handshake<T>(&self, io: T) -> Result<(T, O), errors::Error>
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
@@ -132,7 +132,7 @@ where
                 let remote_addr: Destination = dst.into();
                 let (atyp, addr, port) = remote_addr.into_tuple();
                 frame.send(Item::Reply(SUCCEEDED, atyp, addr, port)).await?;
-                Ok((stream, frame.into_inner()))
+                Ok((frame.into_inner(), stream))
             }
             Err(e) => {
                 frame
@@ -144,11 +144,10 @@ where
     }
 
     async fn connect(&self, destination: Destination) -> Result<(O, D), errors::Error> {
-        Ok(self
-            .connect
+        self.connect
             .connect(destination)
             .await
-            .map_err(|e| e.into())?)
+            .map_err(|e| e.into())
     }
 
     pub fn new(connect: C) -> Self {

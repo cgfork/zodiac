@@ -64,7 +64,11 @@ impl Builder {
         }
 
         // Write destination
-        let (atyp, addr, port) = self.destination.clone().unwrap().into_tuple();
+        let (atyp, addr, port) = self
+            .destination
+            .clone()
+            .ok_or_else(|| errors::Error::AddressTypeNotSupported)?
+            .into_tuple();
         if let Item::Reply(rep, atyp, host, port) = send_wait(
             &mut frame,
             Item::Command(CONNECT, atyp, addr, port),
@@ -100,4 +104,3 @@ impl Builder {
         self
     }
 }
-

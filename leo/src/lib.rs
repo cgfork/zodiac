@@ -1,3 +1,6 @@
 pub mod client;
+mod codec;
 pub mod server;
-mod tokiort;
+
+mod errors;
+pub use errors::Error;
