@@ -46,7 +46,7 @@ impl Peer for std::net::TcpStream {
 }
 
 #[cfg(feature = "tokio-native-tls")]
-impl<T> Peer for TlsStream<T>
+impl<T> Peer for tokio_native_tls::TlsStream<T>
 where
     T: Peer,
 {
