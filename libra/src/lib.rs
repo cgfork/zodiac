@@ -8,11 +8,56 @@ mod codec;
 mod errors;
 pub mod server;
 pub use errors::Error;
+use tokio::net::TcpStream;
 
 use std::{
-    fmt,
+    fmt, io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
 };
+
+pub trait Peer {
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+
+    fn remote_addr(&self) -> io::Result<SocketAddr>;
+
+    fn peer_addr(&self) -> io::Result<(SocketAddr, SocketAddr)> {
+        Ok((self.local_addr()?, self.remote_addr()?))
+    }
+}
+
+impl Peer for TcpStream {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        TcpStream::local_addr(self)
+    }
+
+    fn remote_addr(&self) -> io::Result<SocketAddr> {
+        TcpStream::peer_addr(self)
+    }
+}
+
+impl Peer for std::net::TcpStream {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        std::net::TcpStream::local_addr(self)
+    }
+
+    fn remote_addr(&self) -> io::Result<SocketAddr> {
+        std::net::TcpStream::peer_addr(self)
+    }
+}
+
+#[cfg(feature = "tokio-native-tls")]
+impl<T> Peer for TlsStream<T>
+where
+    T: Peer,
+{
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.get_ref().get_ref().get_ref().local_addr()
+    }
+
+    fn remote_addr(&self) -> io::Result<SocketAddr> {
+        self.get_ref().get_ref().get_ref().remote_addr()
+    }
+}
 
 use codec::{DST_DOMAIN, DST_IPV4, DST_IPV6};
 #[derive(Debug, Clone)]

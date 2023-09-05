@@ -14,7 +14,7 @@ use crate::{
         HOST_UNREACHABLE, NO_ACCEPTABLE_METHODS, NO_AUTHENTICATION_REQUIRED, SUCCEEDED,
         USERNAME_AND_PASSWORD,
     },
-    errors, Destination,
+    errors, Destination, Peer,
 };
 
 pub trait Connect {
@@ -32,18 +32,14 @@ pub struct TokioStream;
 impl Connect for TokioStream {
     type Err = io::Error;
 
-    type Output = (TcpStream, SocketAddr);
+    type Output = TcpStream;
 
     type Future<'a> = impl Future<Output = Result<Self::Output, Self::Err>> + Unpin + 'a
     where
         Self: 'a;
 
     fn connect(&self, destination: Destination) -> Self::Future<'_> {
-        Box::pin(async move {
-            let stream = TcpStream::connect(destination.to_string()).await?;
-            let remote_addr = stream.peer_addr()?;
-            Ok((stream, remote_addr))
-        })
+        Box::pin(async move { Ok(TcpStream::connect(destination.to_string()).await?) })
     }
 }
 
@@ -53,11 +49,10 @@ pub struct Builder<C> {
     connect: C,
 }
 
-impl<C, O, D, E> Builder<C>
+impl<C, O, E> Builder<C>
 where
-    C: Connect<Output = (O, D), Err = E>,
-    O: AsyncRead + AsyncWrite + Unpin,
-    D: Into<Destination>,
+    C: Connect<Output = O, Err = E>,
+    O: AsyncRead + AsyncWrite + Unpin + Peer,
     E: Into<errors::Error>,
 {
     pub async fn handshake<T>(&self, io: T) -> Result<(T, O), errors::Error>
@@ -128,9 +123,12 @@ where
             }
         }
         match self.connect(destination.unwrap()).await {
-            Ok((stream, dst)) => {
-                let remote_addr: Destination = dst.into();
-                let (atyp, addr, port) = remote_addr.into_tuple();
+            Ok(stream) => {
+                let remote_addr = stream.remote_addr()?;
+                let (atyp, addr, port) = match remote_addr {
+                    SocketAddr::V4(v4) => (DST_IPV4, v4.ip().octets().to_vec(), v4.port()),
+                    SocketAddr::V6(v6) => (DST_IPV6, v6.ip().octets().to_vec(), v6.port()),
+                };
                 frame.send(Item::Reply(SUCCEEDED, atyp, addr, port)).await?;
                 Ok((frame.into_inner(), stream))
             }
@@ -143,7 +141,7 @@ where
         }
     }
 
-    async fn connect(&self, destination: Destination) -> Result<(O, D), errors::Error> {
+    async fn connect(&self, destination: Destination) -> Result<O, errors::Error> {
         self.connect
             .connect(destination)
             .await
