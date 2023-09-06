@@ -1,3 +1,4 @@
+use base64::Engine;
 use bytes::BytesMut;
 use log::trace;
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
@@ -46,5 +47,13 @@ impl Builder {
             Some(s) => Some(s.as_str()),
             None => None,
         }
+    }
+
+    pub fn set_authorization(mut self, username: &str, password: &str) -> Self {
+        let raw = format!("{}:{}", username, password);
+        let mut encoded = String::from("Basic ");
+        base64::engine::general_purpose::STANDARD.encode_string(raw.as_bytes(), &mut encoded);
+        self.authorization = Some(encoded);
+        self
     }
 }

@@ -154,4 +154,9 @@ where
             connect,
         }
     }
+
+    pub fn set_authorization(mut self, username: String, password: String) -> Self {
+        self.authorization = Some((username, password));
+        self
+    }
 }
