@@ -1,64 +1,30 @@
-use std::{io, net::SocketAddr};
+use std::net::SocketAddr;
 
-use futures_util::{Future, SinkExt};
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    net::TcpStream,
-};
+use futures_util::SinkExt;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::Decoder;
 
 use crate::{
     codec::{
         recv, rep_str, Codec, DecoderState, Item, ADDRESS_TYPE_NOT_SUPPORTED, AUTH_FAILED,
         AUTH_SUCCEED, COMMAND_NOT_SUPPORTED, CONNECT, DST_DOMAIN, DST_IPV4, DST_IPV6,
-        HOST_UNREACHABLE, NO_ACCEPTABLE_METHODS, NO_AUTHENTICATION_REQUIRED, SUCCEEDED,
-        USERNAME_AND_PASSWORD,
+        NO_ACCEPTABLE_METHODS, NO_AUTHENTICATION_REQUIRED, SUCCEEDED, USERNAME_AND_PASSWORD,
     },
     errors, Destination, Peer,
 };
 
-pub trait Connect {
-    type Err;
-    type Output;
-    type Future<'a>: Future<Output = Result<Self::Output, Self::Err>> + Send
-    where
-        Self: 'a;
-
-    fn connect(&mut self, destination: Destination) -> Self::Future<'_>;
-}
-
-pub struct TokioStream;
-
-impl Connect for TokioStream {
-    type Err = io::Error;
-
-    type Output = TcpStream;
-
-    type Future<'a> = impl Future<Output = Result<Self::Output, Self::Err>> + Send + 'a
-    where
-        Self: 'a;
-
-    fn connect(&mut self, destination: Destination) -> Self::Future<'_> {
-        Box::pin(async move { TcpStream::connect(destination.to_string()).await })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Builder<C> {
+#[derive(Debug, Clone, Default)]
+pub struct Builder {
     authorization: Option<(String, String)>,
-    connect: C,
+    bind_addr: Option<SocketAddr>,
 }
 
-impl<C, O, E> Builder<C>
-where
-    C: Connect<Output = O, Err = E> + Clone,
-    O: AsyncRead + AsyncWrite + Unpin + Peer,
-    E: Into<errors::Error>,
-{
-    pub async fn handshake<T>(&self, io: T) -> Result<(T, O), errors::Error>
+impl Builder {
+    pub async fn handshake<T>(&self, io: T) -> Result<(T, String), errors::Error>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: AsyncRead + AsyncWrite + Peer + Unpin,
     {
+        let local_addr = io.local_addr()?;
         let mut frame = Codec::new(DecoderState::Methods).framed(io);
         if let Item::Methods(methods) = recv(&mut frame, DecoderState::Methods).await? {
             if let Some((user, pass)) = &self.authorization {
@@ -122,40 +88,29 @@ where
                 }
             }
         }
-        match self
-            .connect
-            .clone()
-            .connect(destination.unwrap())
-            .await
-            .map_err(|e| e.into())
-        {
-            Ok(stream) => {
-                let remote_addr = stream.remote_addr()?;
-                let (atyp, addr, port) = match remote_addr {
-                    SocketAddr::V4(v4) => (DST_IPV4, v4.ip().octets().to_vec(), v4.port()),
-                    SocketAddr::V6(v6) => (DST_IPV6, v6.ip().octets().to_vec(), v6.port()),
-                };
-                frame.send(Item::Reply(SUCCEEDED, atyp, addr, port)).await?;
-                Ok((frame.into_inner(), stream))
-            }
-            Err(e) => {
-                frame
-                    .send(Item::Reply(HOST_UNREACHABLE, DST_IPV4, vec![0, 0, 0, 0], 0))
-                    .await?;
-                Err(e)
-            }
-        }
-    }
 
-    pub fn new(connect: C) -> Self {
-        Self {
-            authorization: None,
-            connect,
-        }
+        let bnd_addr = if let Some(addr) = self.bind_addr.clone() {
+            addr
+        } else {
+            local_addr
+        };
+
+        let (atyp, addr, port) = match bnd_addr {
+            SocketAddr::V4(v4) => (DST_IPV4, v4.ip().octets().to_vec(), v4.port()),
+            SocketAddr::V6(v6) => (DST_IPV6, v6.ip().octets().to_vec(), v6.port()),
+        };
+
+        frame.send(Item::Reply(SUCCEEDED, atyp, addr, port)).await?;
+        Ok((frame.into_inner(), destination.unwrap().to_string()))
     }
 
     pub fn set_authorization(mut self, username: String, password: String) -> Self {
         self.authorization = Some((username, password));
+        self
+    }
+
+    pub fn set_bnd_addr(mut self, bind: SocketAddr) -> Self {
+        self.bind_addr = Some(bind);
         self
     }
 }
