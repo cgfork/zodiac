@@ -24,7 +24,7 @@ pub trait Connect {
     where
         Self: 'a;
 
-    fn connect(&self, destination: Destination) -> Self::Future<'_>;
+    fn connect(&mut self, destination: Destination) -> Self::Future<'_>;
 }
 
 pub struct TokioStream;
@@ -38,8 +38,8 @@ impl Connect for TokioStream {
     where
         Self: 'a;
 
-    fn connect(&self, destination: Destination) -> Self::Future<'_> {
-        Box::pin(async move { Ok(TcpStream::connect(destination.to_string()).await?) })
+    fn connect(&mut self, destination: Destination) -> Self::Future<'_> {
+        Box::pin(async move { TcpStream::connect(destination.to_string()).await })
     }
 }
 
@@ -51,7 +51,7 @@ pub struct Builder<C> {
 
 impl<C, O, E> Builder<C>
 where
-    C: Connect<Output = O, Err = E>,
+    C: Connect<Output = O, Err = E> + Clone,
     O: AsyncRead + AsyncWrite + Unpin + Peer,
     E: Into<errors::Error>,
 {
@@ -122,7 +122,13 @@ where
                 }
             }
         }
-        match self.connect(destination.unwrap()).await {
+        match self
+            .connect
+            .clone()
+            .connect(destination.unwrap())
+            .await
+            .map_err(|e| e.into())
+        {
             Ok(stream) => {
                 let remote_addr = stream.remote_addr()?;
                 let (atyp, addr, port) = match remote_addr {
@@ -139,13 +145,6 @@ where
                 Err(e)
             }
         }
-    }
-
-    async fn connect(&self, destination: Destination) -> Result<O, errors::Error> {
-        self.connect
-            .connect(destination)
-            .await
-            .map_err(|e| e.into())
     }
 
     pub fn new(connect: C) -> Self {
