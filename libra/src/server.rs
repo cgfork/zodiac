@@ -20,7 +20,7 @@ use crate::{
 pub trait Connect {
     type Err;
     type Output;
-    type Future<'a>: Future<Output = Result<Self::Output, Self::Err>> + Unpin
+    type Future<'a>: Future<Output = Result<Self::Output, Self::Err>> + Send
     where
         Self: 'a;
 
@@ -34,7 +34,7 @@ impl Connect for TokioStream {
 
     type Output = TcpStream;
 
-    type Future<'a> = impl Future<Output = Result<Self::Output, Self::Err>> + Unpin + 'a
+    type Future<'a> = impl Future<Output = Result<Self::Output, Self::Err>> + Send + 'a
     where
         Self: 'a;
 
